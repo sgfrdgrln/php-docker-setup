@@ -1,0 +1,229 @@
+name: "Release New Version"
+run-name: "Release ${{ inputs.version }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "The version to be released in PECL format (e.g. 1.19.1, 1.20.0beta1)"
+        required: true
+        type: "string"
+      jira-version-number:
+        description: "JIRA version ID (e.g. 54321)"
+        required: true
+        type: "string"
+
+env:
+  default-release-message: |
+    The PHP team is happy to announce that version {0} of the [mongodb](https://pecl.php.net/package/mongodb) PHP extension is now available on PECL.
+
+    **Release Highlights**
+
+    TODO: one or more paragraphs describing important changes in this release
+
+    A complete list of resolved issues in this release may be found in [JIRA](https://jira.mongodb.org/secure/ReleaseNote.jspa?version={1}&projectId=12484).
+
+    **Documentation**
+
+    Documentation is available on [PHP.net](https://php.net/set.mongodb).
+
+    **Installation**
+
+    You can either download and install the source manually, or you can install the extension with:
+
+    ```
+    pecl install mongodb-{0}
+    ```
+
+    or update with:
+
+    ```
+    pecl upgrade mongodb-{0}
+    ```
+
+    Windows binaries are attached to the GitHub release notes.
+
+jobs:
+  prepare-release:
+    environment: release
+    name: "Prepare release"
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+      - name: "Check version number format"
+        run: |
+          if ! [[ "${{ inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+((alpha|beta|RC)[0-9]+)?$ ]]; then
+            echo '❌ Version ${{ inputs.version }} does not match expected format' >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+      - name: "Create release output"
+        run: echo '🎬 Release process for version ${{ inputs.version }} started by @${{ github.triggering_actor }}' >> $GITHUB_STEP_SUMMARY
+
+      - name: "Generate token and checkout repository"
+        uses: mongodb-labs/drivers-github-tools/secure-checkout@v2
+        with:
+          app_id: ${{ vars.APP_ID }}
+          private_key: ${{ secrets.APP_PRIVATE_KEY }}
+          submodules: true
+          fetch-depth: 0
+
+      - name: "Set up drivers-github-tools"
+        uses: mongodb-labs/drivers-github-tools/setup@v2
+        with:
+          aws_role_arn: ${{ secrets.AWS_ROLE_ARN }}
+          aws_region_name: ${{ vars.AWS_REGION_NAME }}
+          aws_secret_id: ${{ secrets.AWS_SECRET_ID }}
+
+      - name: "Install PHP"
+        uses: "shivammathur/setup-php@v2"
+        with:
+          php-version: "${{ matrix.php-version }}"
+
+      - name: "Create package commit"
+        uses: mongodb-labs/drivers-github-tools/bump-version@v2
+        with:
+          version: ${{ inputs.version }}
+          # Note: this script will fail and abort if the requested version can't be released
+          version_bump_script: "./bin/update-release-version.php release"
+          commit_template: 'Package ${VERSION}'
+          # Don't push changes as we're creating a second commit later
+          push_commit: false
+
+      - name: "Create release tag"
+        uses: mongodb-labs/drivers-github-tools/tag-version@v2
+        with:
+          version: ${{ inputs.version }}
+          tag_message_template: 'Release ${VERSION}'
+          # Don't push tag, we'll do that after merging up
+          push_tag: false
+
+      - name: "Bump to next development release and commit"
+        uses: mongodb-labs/drivers-github-tools/bump-version@v2
+        with:
+          version: ${{ inputs.version }}
+          version_bump_script: "./bin/update-release-version.php to-next-dev"
+          commit_template: 'Back to -dev'
+          # Don't push commit, we still need to merge up
+          push_commit: false
+
+      - name: "Determine branch to merge up to"
+        id: get-next-branch
+        uses: alcaeus/automatic-merge-up-action/get-next-branch@main
+        with:
+          ref: ${{ github.ref_name }}
+          branchNamePattern: 'v<major>.<minor>'
+          fallbackBranch: 'master'
+
+      - name: "Manually merge up changes"
+        if: ${{ steps.get-next-branch.outputs.hasNextBranch }}
+        run: |
+          git checkout ${NEXT_BRANCH}
+          git merge --strategy=ours ${RELEASE_BRANCH}
+          git push origin ${NEXT_BRANCH}
+          git checkout ${RELEASE_BRANCH}
+        env:
+          NEXT_BRANCH: ${{ steps.get-next-branch.outputs.branchName }}
+          RELEASE_BRANCH: ${{ github.ref_name }}
+
+      - name: "Push tag and release branch"
+        run: |
+          git push origin ${RELEASE_BRANCH}
+          git push origin tag ${{ inputs.version }}
+        env:
+          RELEASE_BRANCH: ${{ github.ref_name }}
+
+      - name: "Prepare release message"
+        run: |
+          cat > release-message <<'EOL'
+          ${{ format(env.default-release-message, inputs.version, inputs.jira-version-number) }}
+          EOL
+
+      - name: "Create draft release"
+        run: |
+          if [[ "${{ inputs.version }}" =~ (alpha|beta|RC) ]]; then
+            PRERELEASE="--prerelease --latest=false"
+          fi
+          echo "RELEASE_URL=$(gh release create ${{ inputs.version }} ${PRERELEASE} --target ${{ github.ref_name }} --title "${{ inputs.version }}" --notes-file release-message --draft)" >> "$GITHUB_ENV"
+
+      - name: "Set summary"
+        run: |
+          echo '🚀 Created tag and drafted release for version [${{ inputs.version }}](${{ env.RELEASE_URL }})' >> $GITHUB_STEP_SUMMARY
+          echo '✍️ You may now update the release notes and publish the release when ready' >> $GITHUB_STEP_SUMMARY
+
+  static-analysis:
+    needs: prepare-release
+    name: "Run Static Analysis"
+    uses: ./.github/workflows/static-analysis.yml
+    with:
+      ref: refs/tags/${{ inputs.version }}
+    permissions:
+      security-events: write
+      id-token: write
+
+  package-release:
+    needs: prepare-release
+    name: "Create Release Packages"
+    uses: ./.github/workflows/package-release.yml
+    with:
+      version: ${{ inputs.version }}
+      ref: refs/tags/${{ inputs.version }}
+    secrets: inherit
+    permissions:
+      id-token: write
+      contents: write
+
+  publish-ssdlc-assets:
+    needs:
+      - static-analysis
+      - package-release
+    environment: release
+    name: "Publish SSDLC Assets"
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: read
+      id-token: write
+      contents: write
+
+    steps:
+      - name: "Generate token and checkout repository"
+        uses: mongodb-labs/drivers-github-tools/secure-checkout@v2
+        with:
+          app_id: ${{ vars.APP_ID }}
+          private_key: ${{ secrets.APP_PRIVATE_KEY }}
+          ref: refs/tags/${{ inputs.version }}
+
+      # Sets the S3_ASSETS environment variable used later
+      - name: "Set up drivers-github-tools"
+        uses: mongodb-labs/drivers-github-tools/setup@v2
+        with:
+          aws_role_arn: ${{ secrets.AWS_ROLE_ARN }}
+          aws_region_name: ${{ vars.AWS_REGION_NAME }}
+          aws_secret_id: ${{ secrets.AWS_SECRET_ID }}
+
+      - name: "Remove unnecessary files"
+        run: rm -f ${RELEASE_ASSETS}/release_run_id.txt
+        shell: bash
+
+      - name: Download all release artifacts
+        run: gh release download ${{ inputs.version }} --dir ${{ env.RELEASE_ASSETS }}
+
+      - name: "Generate SSDLC Reports"
+        uses: mongodb-labs/drivers-github-tools/full-report@v2
+        with:
+          product_name: "MongoDB PHP Driver (extension)"
+          release_version: ${{ inputs.version }}
+          dist_filenames: "${{ env.RELEASE_ASSETS }}/*"
+          silk_asset_group: mongodb-php-driver-extension
+
+      - name: "Upload SBOM as release artifact"
+        run: gh release upload ${{ inputs.version }} ${{ env.S3_ASSETS }}/cyclonedx.sbom.json
+
+      - name: Upload S3 assets
+        uses: mongodb-labs/drivers-github-tools/upload-s3-assets@v2
+        with:
+          version: ${{ inputs.version }}
+          product_name: mongo-php-driver

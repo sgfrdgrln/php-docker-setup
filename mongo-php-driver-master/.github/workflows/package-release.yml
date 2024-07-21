@@ -1,0 +1,103 @@
+name: "Package Release"
+run-name: "Package Release ${{ inputs.version }}"
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "The version being built"
+        type: string
+        required: true
+      ref:
+        description: "The git reference to build"
+        type: string
+        required: true
+
+jobs:
+  build-pecl:
+    environment: release
+    name: "Create PECL package"
+    runs-on: "ubuntu-latest"
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+      - name: "Generate token and checkout repository"
+        uses: mongodb-labs/drivers-github-tools/secure-checkout@v2
+        with:
+          app_id: ${{ vars.APP_ID }}
+          private_key: ${{ secrets.APP_PRIVATE_KEY }}
+          ref: ${{ inputs.ref }}
+          submodules: true
+
+      - name: "Set up drivers-github-tools"
+        uses: mongodb-labs/drivers-github-tools/setup@v2
+        with:
+          aws_role_arn: ${{ secrets.AWS_ROLE_ARN }}
+          aws_region_name: ${{ vars.AWS_REGION_NAME }}
+          aws_secret_id: ${{ secrets.AWS_SECRET_ID }}
+
+      - name: "Build Driver"
+        uses: ./.github/actions/linux/build
+        with:
+          version: "8.3"
+
+      - name: "Write changelog file for packaging"
+        run: |
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            /repos/${{ github.repository }}/releases/generate-notes \
+            -f "tag_name=${{ inputs.version }}" --jq '.body' > changelog
+
+      # This will fill in the release notes from the previously generated changelog
+      - name: "Build package.xml"
+        run: "make package.xml RELEASE_NOTES_FILE=$(pwd)/changelog"
+
+      - name: "Build release archive"
+        run: "make package"
+
+      # PECL always uses the version for the package name.
+      # Read it from the version file and store in env to use when uploading artifacts
+      - name: "Read current package version"
+        run: |
+          PACKAGE_VERSION=$(./bin/update-release-version.php get-version)
+          echo "PACKAGE_VERSION=${PACKAGE_VERSION}" >> "$GITHUB_ENV"
+          echo "PACKAGE_FILE=mongodb-${PACKAGE_VERSION}.tgz" >> "$GITHUB_ENV"
+
+      - name: "Create detached signature for PECL package"
+        uses: mongodb-labs/drivers-github-tools/gpg-sign@v2
+        with:
+          filenames: ${{ env.PACKAGE_FILE }}
+
+      - name: "Install release archive to verify correctness"
+        run: sudo pecl install ${{ env.PACKAGE_FILE }}
+
+      # Copy the signature file from the release asset directory to avoid directory issues in the ZIP file
+      # This can be removed once we're no longer uploading build artifacts
+      - name: "Copy signature file"
+        run: cp ${RELEASE_ASSETS}/${{ env.PACKAGE_FILE }}.sig .
+
+      - name: "Upload release artifacts"
+        run: gh release upload ${{ inputs.version }} ${{ env.PACKAGE_FILE }} ${{ env.PACKAGE_FILE }}.sig
+
+  build-windows:
+    name: "Create Windows packages"
+    uses: ./.github/workflows/build-windows-package.yml
+    with:
+      version: ${{ inputs.version }}
+      ref: refs/tags/${{ inputs.version }}
+      php: ${{ matrix.php }}
+      arch: ${{ matrix.arch }}
+      ts: ${{ matrix.ts }}
+      upload_release_asset: true
+    secrets: inherit
+    strategy:
+      fail-fast: false
+      matrix:
+        # Note: keep this in sync with the Windows matrix in windows-tests.yml
+        php: [ "7.4", "8.0", "8.1", "8.2", "8.3" ]
+        arch: [ x64, x86 ]
+        ts: [ ts, nts ]

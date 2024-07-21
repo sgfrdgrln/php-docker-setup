@@ -1,0 +1,106 @@
+name: "Windows Tests"
+
+on:
+  pull_request:
+    branches:
+      - "v*.*"
+      - "master"
+      - "feature/*"
+  push:
+    branches:
+      - "v*.*"
+      - "master"
+      - "feature/*"
+
+jobs:
+  build:
+    name: "Build Windows DLLs"
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: cmd
+
+    strategy:
+      # This matrix intentionally uses fail-fast: false to ensure other builds are finished
+      fail-fast: false
+      matrix:
+        php: [ "7.4", "8.0", "8.1", "8.2", "8.3" ]
+        arch: [ x64, x86 ]
+        ts: [ ts, nts ]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: "Build Driver"
+        id: build-driver
+        uses: ./.github/actions/windows/build
+        with:
+          version: ${{ matrix.php }}
+          arch: ${{ matrix.arch }}
+          ts: ${{ matrix.ts }}
+
+      - name: Cache build artifacts for subsequent builds
+        id: cache-build-artifacts
+        uses: actions/cache/save@v4
+        with:
+          key: ${{ github.sha }}-${{ matrix.php }}-${{ matrix.ts }}-${{ matrix.arch }}
+          path: |
+            ${{ steps.build-driver.outputs.build-dir }}\php_mongodb.dll
+            ${{ steps.build-driver.outputs.build-dir }}\php_mongodb.pdb
+
+  test:
+    name: "Windows Tests"
+    runs-on: windows-2022
+    needs: build
+    defaults:
+      run:
+        shell: cmd
+
+    strategy:
+      # Timeouts starting the MongoDB service are common and should not
+      # interrupt the overall test matrix.
+      fail-fast: false
+      matrix:
+        php: [ "7.4", "8.0", "8.1", "8.2", "8.3" ]
+        arch: [ x64, x86 ]
+        ts: [ ts, nts ]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Prepare build environment
+        id: prepare-build
+        uses: ./.github/actions/windows/prepare-build
+        with:
+          version: ${{ matrix.php }}
+          arch: ${{ matrix.arch }}
+          ts: ${{ matrix.ts }}
+
+      - name: Restore cached build artifacts
+        id: cache-build-artifacts
+        uses: actions/cache/restore@v4
+        with:
+          fail-on-cache-miss: true
+          key: ${{ github.sha }}-${{ matrix.php }}-${{ matrix.ts }}-${{ matrix.arch }}
+          path: |
+            ${{ steps.prepare-build.outputs.build-dir }}\php_mongodb.dll
+            ${{ steps.prepare-build.outputs.build-dir }}\php_mongodb.pdb
+
+      - name: Start MongoDB
+        run: |
+          sc config MongoDB start= auto
+          sc start MongoDB
+
+      - name: Wait until MongoDB is available
+        run: .github/workflows/wait-for-mongodb.bat
+
+      - name: Run Tests
+        run: nmake /nologo test
+        env:
+          NO_INTERACTION: 1
+          REPORT_EXIT_STATUS: 1
+          TESTS: --show-diff

@@ -1,0 +1,65 @@
+name: "Setup PHP driver build environment"
+description: "Prepares the PHP build environment for the MongoDB driver"
+inputs:
+  version:
+    description: "PHP version to build for"
+    required: true
+  arch:
+    description: "The architecture to build for (x64 or x86)"
+    required: true
+  ts:
+    description: "Thread-safety (nts or ts)"
+    required: true
+outputs:
+  build-dir:
+    description: "The build directory to be used"
+    value: ${{steps.get-build-dir.outputs.build_dir}}
+runs:
+  using: composite
+  steps:
+    # Reinstall VC15 (Visual Studio 2017) for PHP 7.4 using a derivation of the
+    # script suggested in https://github.com/actions/runner-images/issues/9701
+    - name: Install VC15 component for PHP 7.4
+      if: ${{ inputs.version == '7.4' }}
+      shell: pwsh
+      run: |
+              Set-Location "C:\Program Files (x86)\Microsoft Visual Studio\Installer\"
+              $installPath = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
+              $component = "Microsoft.VisualStudio.Component.VC.v141.x86.x64"
+              $args = ('/c', "vs_installer.exe", 'modify', '--installPath', "`"$installPath`"", '--add', $component, '--quiet', '--norestart', '--nocache')
+              $process = Start-Process -FilePath cmd.exe -ArgumentList $args -Wait -PassThru -WindowStyle Hidden
+
+    - name: Setup PHP SDK
+      id: setup-php
+      uses: php/setup-php-sdk@v0.8
+      with:
+        version: ${{ inputs.version }}
+        arch: ${{ inputs.arch }}
+        ts: ${{ inputs.ts }}
+        deps: openssl
+
+    - name: Enable Developer Command Prompt
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ inputs.arch }}
+        toolset: ${{ steps.setup-php.outputs.toolset }}
+
+    - name: phpize
+      run: phpize
+      shell: cmd
+
+    - name: configure
+      run: configure --enable-mongodb --with-mongodb-sasl=yes --with-mongodb-client-side-encryption=yes --enable-debug-pack --with-prefix=${{ steps.setup-php.outputs.prefix }}
+      shell: cmd
+
+    - name: Get build directory
+      id: get-build-dir
+      shell: cmd
+      # The last echo command to set the output variable intentionally omits a space between the environment variable
+      # and the output redirector to avoid a trailing space in the generated output variable. Do not add a space.
+      run: |
+        cp .github/workflows/get-build-dir.bat .
+        for /F "usebackq tokens=*" %%i in (`get-build-dir.bat`) do set BUILD_DIR=%%i
+        echo BUILD_DIR=%BUILD_DIR%
+        @chcp 65001>nul
+        echo build_dir=%BUILD_DIR%>> %GITHUB_OUTPUT%
